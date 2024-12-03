@@ -5,7 +5,7 @@ import AvatarStream from './components/Stream/AvatarStream';
 import ChatInterface from './components/Stream/ChatInterface';
 
 const mockUserProfile = {
-  name: "AI Streamer",
+  name: "AI Jazz Instructor",
   profilePic: "https://source.unsplash.com/random/100x100",
 };
 
@@ -24,6 +24,11 @@ function App() {
     setTimeout(() => setStreamStatus('live'), 1500);
   };
 
+  const handleEndStream = () => {
+    setStreamStatus('ended');
+    setTimeout(() => setStreamStatus('idle'), 1500);
+  };
+
   const handleSendMessage = (content: string) => {
     const newMessage = {
       id: Date.now().toString(),
@@ -32,16 +37,6 @@ function App() {
       timestamp: new Date(),
     };
     setMessages(prev => [...prev, newMessage]);
-    
-    setTimeout(() => {
-      const aiResponse = {
-        id: (Date.now() + 1).toString(),
-        content: 'This is a simulated AI response.',
-        sender: 'ai' as const,
-        timestamp: new Date(),
-      };
-      setMessages(prev => [...prev, aiResponse]);
-    }, 1000);
   };
 
   return (
@@ -64,7 +59,6 @@ function App() {
             <AvatarStream
               isLive={streamStatus === 'live'}
               streamStatus={streamStatus}
-              avatarUrl={streamStatus === 'live' ? "https://source.unsplash.com/random/1920x1080" : undefined}
             />
           </div>
           

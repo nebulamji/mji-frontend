@@ -1,0 +1,271 @@
+const express = require("express");
+const http = require("http");
+const WebSocket = require("ws");
+const dotenv = require("dotenv");
+const axios = require("axios");
+const url = require('url'); 
+dotenv.config();
+dotenv.config({ path: `.env.local`, override: true });
+
+const app = express();
+const cors = require('cors');
+app.use(cors());
+app.use(express.json());
+const server = http.createServer(app);
+
+const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
+const deepgramClient = createClient(process.env.DEEPGRAM_API_KEY);
+
+const OpenAI = require('openai');
+const openai = new OpenAI(process.env.OPENAI_API_KEY);
+
+console.log("Deepgram API key:", process.env.DEEPGRAM_API_KEY ? `Set: ${process.env.DEEPGRAM_API_KEY}` : "Not set");
+console.log("OpenAI API key:", process.env.OPENAI_API_KEY ? `Set: ${process.env.OPENAI_API_KEY}` : "Not set");
+console.log("ElevenLabs API key:", process.env.ELEVENLABS_API_KEY ? `Set: ${process.env.ELEVENLABS_API_KEY}` : "Not set");
+console.log("Simli API key:", process.env.NEXT_PUBLIC_SIMLI_API_KEY ? `Set: ${process.env.NEXT_PUBLIC_SIMLI_API_KEY}` : "Not set");
+
+// Connection manager to keep track of active connections
+const connections = new Map();
+
+app.post('/start-conversation', (req, res) => {
+  const { prompt, voiceId } = req.body;
+  if (!prompt || !voiceId) {
+    return res.status(400).json({ error: 'Prompt and voiceId are required' });
+  }
+
+  const connectionId = Date.now().toString();
+  connections.set(connectionId, { prompt, voiceId });
+  res.json({ connectionId, message: 'Conversation started. Connect to WebSocket to continue.' });
+});
+
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on('upgrade', (request, socket, head) => {
+  const { pathname, query } = url.parse(request.url, true);
+  
+  if (pathname === '/ws') {
+    const connectionId = query.connectionId;
+    if (!connectionId || !connections.has(connectionId)) {
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      const connection = connections.get(connectionId);
+      console.log(`WebSocket: Client connected (ID: ${connectionId})`);
+      setupWebSocket(ws, connection.prompt, connection.voiceId, connectionId);
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+const setupWebSocket = (ws, initialPrompt, voiceId, connectionId) => {
+  let is_finals = [];
+  let audioQueue = [];
+  let keepAlive;
+  let currentOpenAIStream = null;
+
+  const deepgram = deepgramClient.listen.live({
+    model: "nova-2",
+    language: "en",
+    smart_format: true,
+    no_delay: true,
+    interim_results: true,
+    endpointing: 300,
+    utterance_end_ms: 1000
+  });
+
+  deepgram.addListener(LiveTranscriptionEvents.Open, () => {
+    console.log(`Deepgram STT: Connected (ID: ${connectionId})`);
+    while (audioQueue.length > 0) {
+      const audioData = audioQueue.shift();
+      deepgram.send(audioData);
+    }
+  });  
+
+  deepgram.addListener(LiveTranscriptionEvents.Transcript, (data) => {
+    const transcript = data.channel.alternatives[0].transcript;
+    if (transcript !== "") {
+      if (data.is_final) {
+        is_finals.push(transcript);
+        if (data.speech_final) {
+          const utterance = is_finals.join(" ");
+          is_finals = [];
+          console.log(`Deepgram STT: [Speech Final] ${utterance} (ID: ${connectionId})`);
+
+          promptLLM(ws, initialPrompt, utterance, voiceId, connectionId);
+
+          console.log('Interrupting');
+          ws.send(JSON.stringify({ type: 'interrupt' }));
+          if (currentOpenAIStream) {
+            currentOpenAIStream.controller.abort();
+            currentOpenAIStream = null;
+          }
+        } else {
+          console.log(`Deepgram STT: [Is Final] ${transcript} (ID: ${connectionId})`);
+        }
+      } else {
+        console.log(`Deepgram STT: [Interim Result] ${transcript} (ID: ${connectionId})`);
+      }
+    }
+  });
+
+  deepgram.addListener(LiveTranscriptionEvents.UtteranceEnd, () => {
+    if (is_finals.length > 0) {
+      const utterance = is_finals.join(" ");
+      is_finals = [];
+      console.log(`Deepgram STT: [Speech Final] ${utterance} (ID: ${connectionId})`);
+      promptLLM(ws, initialPrompt, utterance, voiceId, connectionId);
+    }
+  });
+
+  deepgram.addListener(LiveTranscriptionEvents.Close, () => {
+    console.log(`Deepgram STT: Disconnected (ID: ${connectionId})`);
+    clearInterval(keepAlive);
+    deepgram.removeAllListeners();
+  });
+
+  deepgram.addListener(LiveTranscriptionEvents.Error, (error) => {
+    console.error(`Deepgram STT error (ID: ${connectionId}):`, error);
+  });
+
+  ws.on("message", (message) => {
+    console.log(`WebSocket: Client data received (ID: ${connectionId})`, typeof message, message.length, "bytes");
+
+    if (deepgram.getReadyState() === 1) {
+      deepgram.send(message);
+    } else {
+      console.log(`WebSocket: Data queued for Deepgram. Current state: ${deepgram.getReadyState()} (ID: ${connectionId})`);
+      audioQueue.push(message);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log(`WebSocket: Client disconnected (ID: ${connectionId})`);
+    clearInterval(keepAlive);
+    deepgram.removeAllListeners();
+    connections.delete(connectionId);
+  });
+
+  keepAlive = setInterval(() => {
+    deepgram.keepAlive();
+  }, 10 * 1000);
+
+  connections.set(connectionId, { ...connections.get(connectionId), ws, deepgram });
+};
+
+async function promptLLM(ws, initialPrompt, prompt, voiceId, connectionId) {
+  try {
+    const controller = new AbortController();
+    const stream = await openai.chat.completions.create({
+      model: "gpt-4",
+      messages: [
+        {
+          role: 'assistant',
+          content: initialPrompt
+        },
+        {
+          role: 'user',
+          content: prompt
+        }
+      ],
+      temperature: 1,
+      max_tokens: 50,
+      top_p: 1,
+      stream: true,
+    }, { signal: controller.signal });
+
+    currentOpenAIStream = { stream, controller };
+
+    let fullResponse = '';
+    let elevenLabsWs = null;
+
+    try {
+      for await (const chunk of stream) {
+        if (!connections.has(connectionId)) {
+          console.log(`LLM process stopped: Connection ${connectionId} no longer exists`);
+          break;
+        }
+
+        const chunkMessage = chunk.choices[0]?.delta?.content || '';
+        fullResponse += chunkMessage;
+
+        ws.send(JSON.stringify({ type: 'text', content: chunkMessage }));
+
+        if (!elevenLabsWs && fullResponse.length > 0) {
+          elevenLabsWs = await startElevenLabsStreaming(ws, voiceId, connectionId);
+        }
+
+        if (elevenLabsWs && chunkMessage) {
+          const contentMessage = {
+            text: chunkMessage,
+            try_trigger_generation: true,
+          };
+          elevenLabsWs.send(JSON.stringify(contentMessage));
+        }
+      }
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        console.log('OpenAI stream aborted due to new speech');
+        if (elevenLabsWs) {
+          elevenLabsWs.close();
+        }
+      } else {
+        throw error;
+      }
+    }
+
+    currentOpenAIStream = null;
+
+    if (elevenLabsWs) {
+      elevenLabsWs.send(JSON.stringify({ text: "", try_trigger_generation: true }));
+    }
+
+  } catch (error) {
+    console.error(`Error in promptLLM (ID: ${connectionId}):`, error);
+  }
+}
+
+async function startElevenLabsStreaming(ws, voiceId, connectionId) {
+  return new Promise((resolve, reject) => {
+    const elevenLabsWs = new WebSocket(`wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=eleven_turbo_v2_5&output_format=pcm_16000`);
+
+    elevenLabsWs.on('open', () => {
+      console.log(`Connected to ElevenLabs WebSocket (ID: ${connectionId})`);
+      const initialMessage = {
+        text: " ", 
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.5
+        },
+        xi_api_key: process.env.ELEVENLABS_API_KEY,
+      };
+      elevenLabsWs.send(JSON.stringify(initialMessage));
+      resolve(elevenLabsWs);
+    });
+
+    elevenLabsWs.on('message', (data) => {
+      if (!connections.has(connectionId)) {
+        console.log(`ElevenLabs process stopped: Connection ${connectionId} no longer exists`);
+        elevenLabsWs.close();
+        return;
+      }
+      ws.send(data);
+    });
+
+    elevenLabsWs.on('error', (error) => {
+      console.error(`ElevenLabs WebSocket error (ID: ${connectionId}):`, error);
+      reject(error);
+    });
+
+    elevenLabsWs.on('close', () => {
+      console.log(`ElevenLabs WebSocket closed (ID: ${connectionId})`);
+    });
+  });
+}
+
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+}); 
