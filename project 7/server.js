@@ -28,13 +28,13 @@ console.log("Simli API key:", process.env.NEXT_PUBLIC_SIMLI_API_KEY ? `Set: ${pr
 const connections = new Map();
 
 app.post('/start-conversation', (req, res) => {
-  const { prompt, voiceId } = req.body;
+  const { prompt, voiceId, roomId, userId } = req.body;
   if (!prompt || !voiceId) {
     return res.status(400).json({ error: 'Prompt and voiceId are required' });
   }
 
   const connectionId = Date.now().toString();
-  connections.set(connectionId, { prompt, voiceId });
+  connections.set(connectionId, { prompt, voiceId, roomId, userId });
   res.json({ connectionId, message: 'Conversation started. Connect to WebSocket to continue.' });
 });
 
@@ -53,14 +53,14 @@ server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
       const connection = connections.get(connectionId);
       console.log(`WebSocket: Client connected (ID: ${connectionId})`);
-      setupWebSocket(ws, connection.prompt, connection.voiceId, connectionId);
+      setupWebSocket(ws, connection.prompt, connection.voiceId, connectionId, connection.roomId, connection.userId);
     });
   } else {
     socket.destroy();
   }
 });
 
-const setupWebSocket = (ws, initialPrompt, voiceId, connectionId) => {
+const setupWebSocket = (ws, initialPrompt, voiceId, connectionId, roomId, userId) => {
   let is_finals = [];
   let audioQueue = [];
   let keepAlive;
@@ -94,7 +94,7 @@ const setupWebSocket = (ws, initialPrompt, voiceId, connectionId) => {
           is_finals = [];
           console.log(`Deepgram STT: [Speech Final] ${utterance} (ID: ${connectionId})`);
 
-          promptLLM(ws, initialPrompt, utterance, voiceId, connectionId);
+          promptLLM(ws, initialPrompt, utterance, voiceId, connectionId, roomId, userId);
 
           console.log('Interrupting');
           ws.send(JSON.stringify({ type: 'interrupt' }));
@@ -116,7 +116,7 @@ const setupWebSocket = (ws, initialPrompt, voiceId, connectionId) => {
       const utterance = is_finals.join(" ");
       is_finals = [];
       console.log(`Deepgram STT: [Speech Final] ${utterance} (ID: ${connectionId})`);
-      promptLLM(ws, initialPrompt, utterance, voiceId, connectionId);
+      promptLLM(ws, initialPrompt, utterance, voiceId, connectionId, roomId, userId);
     }
   });
 
@@ -155,7 +155,7 @@ const setupWebSocket = (ws, initialPrompt, voiceId, connectionId) => {
   connections.set(connectionId, { ...connections.get(connectionId), ws, deepgram });
 };
 
-async function promptLLM(ws, initialPrompt, prompt, voiceId, connectionId) {
+async function promptLLM(ws, initialPrompt, prompt, voiceId, connectionId, roomId, userId) {
   try {
     const controller = new AbortController();
     const stream = await openai.chat.completions.create({
